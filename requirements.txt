@@ -1,0 +1,4 @@
+tensorflow>=2.16.1
+tensorflow-hub>=0.14.0
+opencv-python>=4.5.0
+numpy>=1.19.0 
