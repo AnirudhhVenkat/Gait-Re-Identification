@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 import pandas as pd
 from tqdm import tqdm
+import math
 
 def load_pose_data(file_path: str) -> Dict:
     """Load pose data from JSON file."""
