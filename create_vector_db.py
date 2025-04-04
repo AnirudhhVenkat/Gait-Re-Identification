@@ -1,536 +1,526 @@
-import numpy as np
-import pandas as pd
-import faiss
-import json
 import os
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime
-import tensorflow as tf
-from tensorflow.keras.layers import Input, Dense, BatchNormalization, Dropout, Add, Embedding, Flatten, Concatenate
-from tensorflow.keras.models import Model
-from tensorflow.keras.models import load_model
-import joblib
-from sklearn.manifold import TSNE
-from tensorflow.keras.optimizers import Adam
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import silhouette_score, calinski_harabasz_score
-from sklearn.cluster import KMeans
-import plotly.graph_objects as go
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
-from pathlib import Path
-from typing import Dict, List, Tuple
+import json
+import torch
+import numpy as np
+from typing import List, Dict, Tuple, Optional, Any
 from tqdm import tqdm
+import pickle
+from sklearn.preprocessing import StandardScaler
+import gc
+import matplotlib.pyplot as plt
+import pandas as pd
+from sklearn.feature_selection import mutual_info_classif
 
-def load_gait_analysis(file_path: str) -> Dict:
-    """Load gait analysis data from JSON file."""
+# Initialize CUDA for PyTorch
+if torch.cuda.is_available():
+    device = torch.device('cuda')
+    torch.cuda.empty_cache()  # Clear GPU memory
+    print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+else:
+    device = torch.device('cpu')
+    print("Using CPU - No GPU available")
+
+
+def load_gait_analysis(file_path: str) -> Dict[str, Any]:
+    """Load gait analysis data from a JSON file.
+    
+    Args:
+        file_path: Path to the JSON file containing gait analysis data.
+        
+    Returns:
+        Dictionary containing the gait analysis data.
+    """
     with open(file_path, 'r') as f:
         return json.load(f)
 
-def extract_features(analysis: Dict, subject_id: str) -> np.ndarray:
-    """Extract features from gait analysis data with subject-specific normalization."""
-    # Get real-time features
-    real_time_features = analysis['real_time_features']
+
+def calculate_angle(p1: np.ndarray, p2: np.ndarray, p3: np.ndarray) -> float:
+    """Calculate the angle between three points.
     
-    # Calculate statistics from real-time features
-    joint_angles = []
-    structural_measurements = []
-    dynamic_measurements = []
-    symmetry_scores = []
-    
-    for frame in real_time_features:
-        # Extract joint angles
-        joint_angles.append([
-            frame['joint_angles']['left_hip'],
-            frame['joint_angles']['right_hip'],
-            frame['joint_angles']['left_knee'],
-            frame['joint_angles']['right_knee'],
-            frame['joint_angles']['left_ankle'],
-            frame['joint_angles']['right_ankle']
-        ])
+    Args:
+        p1: First point coordinates.
+        p2: Second point coordinates (vertex).
+        p3: Third point coordinates.
         
-        # Extract structural measurements
-        structural_measurements.append([
-            frame['step_width'],
-            frame['hip_width']
-        ])
+    Returns:
+        Angle in degrees between the three points.
+    """
+    v1 = p1 - p2
+    v2 = p3 - p2
+    cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+    cos_angle = np.clip(cos_angle, -1.0, 1.0)
+    return np.degrees(np.arccos(cos_angle))
+
+
+def calculate_physical_features(pose_data: Dict[str, Any]) -> Tuple[float, float]:
+    """Calculate physical features from pose data.
+    
+    Args:
+        pose_data: Dictionary containing pose keypoints.
         
-        # Extract dynamic measurements (without cadence)
-        dynamic_measurements.append([
-            frame['step_length'],
-            frame['walking_speed']
-        ])
+    Returns:
+        Tuple containing step width and hip width.
+    """
+    left_ankle = np.array([
+        pose_data['left_ankle']['x'],
+        pose_data['left_ankle']['y'],
+        pose_data['left_ankle']['z']
+    ])
+    right_ankle = np.array([
+        pose_data['right_ankle']['x'],
+        pose_data['right_ankle']['y'],
+        pose_data['right_ankle']['z']
+    ])
+    left_hip = np.array([
+        pose_data['left_hip']['x'],
+        pose_data['left_hip']['y'],
+        pose_data['left_hip']['z']
+    ])
+    right_hip = np.array([
+        pose_data['right_hip']['x'],
+        pose_data['right_hip']['y'],
+        pose_data['right_hip']['z']
+    ])
+    
+    step_width = np.abs(left_ankle[0] - right_ankle[0])
+    hip_width = np.abs(left_hip[0] - right_hip[0])
+    
+    return step_width, hip_width
+
+
+def calculate_angles(pose_data: Dict[str, Any]) -> Tuple[float, float]:
+    """Calculate hip angles from pose data.
+    
+    Args:
+        pose_data: Dictionary containing pose keypoints.
         
-        # Extract symmetry score
-        symmetry_scores.append(frame['symmetry'])
+    Returns:
+        Tuple containing left and right hip angles in degrees.
+    """
+    left_hip = np.array([
+        pose_data['left_hip']['x'],
+        pose_data['left_hip']['y'],
+        pose_data['left_hip']['z']
+    ])
+    left_knee = np.array([
+        pose_data['left_knee']['x'],
+        pose_data['left_knee']['y'],
+        pose_data['left_knee']['z']
+    ])
+    left_ankle = np.array([
+        pose_data['left_ankle']['x'],
+        pose_data['left_ankle']['y'],
+        pose_data['left_ankle']['z']
+    ])
+    right_hip = np.array([
+        pose_data['right_hip']['x'],
+        pose_data['right_hip']['y'],
+        pose_data['right_hip']['z']
+    ])
+    right_knee = np.array([
+        pose_data['right_knee']['x'],
+        pose_data['right_knee']['y'],
+        pose_data['right_knee']['z']
+    ])
+    right_ankle = np.array([
+        pose_data['right_ankle']['x'],
+        pose_data['right_ankle']['y'],
+        pose_data['right_ankle']['z']
+    ])
     
-    # Convert to numpy arrays
-    joint_angles = np.array(joint_angles)
-    structural_measurements = np.array(structural_measurements)
-    dynamic_measurements = np.array(dynamic_measurements)
-    symmetry_scores = np.array(symmetry_scores)
+    left_angle = calculate_angle(left_hip, left_knee, left_ankle)
+    right_angle = calculate_angle(right_hip, right_knee, right_ankle)
     
-    # Subject-specific normalization
-    # Use the first trial's measurements as reference for this subject
-    reference_measurements = {
-        'step_width': np.mean(structural_measurements[:, 0]),
-        'hip_width': np.mean(structural_measurements[:, 1]),
-        'step_length': np.mean(dynamic_measurements[:, 0])
-    }
+    return left_angle, right_angle
+
+
+def calculate_step_length(pose_data: Dict[str, Any], 
+                         prev_pose_data: Optional[Dict[str, Any]] = None) -> float:
+    """Calculate step length from current and previous pose data.
     
-    # Normalize structural measurements relative to subject's reference
-    structural_measurements[:, 0] /= reference_measurements['step_width']
-    structural_measurements[:, 1] /= reference_measurements['hip_width']
-    dynamic_measurements[:, 0] /= reference_measurements['step_length']
+    Args:
+        pose_data: Current pose data.
+        prev_pose_data: Previous pose data, if available.
+        
+    Returns:
+        Step length, or 0 if previous pose data is not available.
+    """
+    if prev_pose_data is None:
+        return 0.0
     
-    # Calculate statistics
+    current_ankle = np.array([
+        pose_data['right_ankle']['x'],
+        pose_data['right_ankle']['y'],
+        pose_data['right_ankle']['z']
+    ])
+    prev_ankle = np.array([
+        prev_pose_data['right_ankle']['x'],
+        prev_pose_data['right_ankle']['y'],
+        prev_pose_data['right_ankle']['z']
+    ])
+    
+    return np.linalg.norm(current_ankle - prev_ankle)
+
+
+def calculate_stride_length(pose_data: Dict[str, Any], 
+                          prev_pose_data: Optional[Dict[str, Any]] = None) -> float:
+    """Calculate stride length from current and previous pose data.
+    
+    Args:
+        pose_data: Current pose data.
+        prev_pose_data: Previous pose data, if available.
+        
+    Returns:
+        Stride length, or 0 if previous pose data is not available.
+    """
+    if prev_pose_data is None:
+        return 0.0
+    
+    current_ankle = np.array([
+        pose_data['left_ankle']['x'],
+        pose_data['left_ankle']['y'],
+        pose_data['left_ankle']['z']
+    ])
+    prev_ankle = np.array([
+        prev_pose_data['left_ankle']['x'],
+        prev_pose_data['left_ankle']['y'],
+        prev_pose_data['left_ankle']['z']
+    ])
+    
+    return np.linalg.norm(current_ankle - prev_ankle)
+
+
+def extract_gait_features_batch(pose_data_list: List[Dict[str, Any]]) -> np.ndarray:
+    """Extract gait features from a batch of pose data.
+    
+    Args:
+        pose_data_list: List of pose data dictionaries.
+        
+    Returns:
+        Array of extracted gait features averaged over the window.
+    """
     features = []
+    prev_pose_data = None
     
-    # Joint angle statistics
-    for i in range(6):  # 6 joint angles
-        features.extend([
-            float(np.mean(joint_angles[:, i])),
-            float(np.std(joint_angles[:, i]))
+    for pose_data in pose_data_list:
+        # Calculate physical features
+        step_width, hip_width = calculate_physical_features(pose_data)
+        
+        # Calculate angles
+        left_angle, right_angle = calculate_angles(pose_data)
+        
+        # Calculate step and stride lengths
+        step_length = calculate_step_length(pose_data, prev_pose_data)
+        stride_length = calculate_stride_length(pose_data, prev_pose_data)
+        
+        # Store features
+        features.append([
+            step_width,
+            hip_width,
+            left_angle,
+            right_angle,
+            step_length,
+            step_length,  # Using same value for std dev placeholder
+            stride_length,
+            stride_length  # Using same value for std dev placeholder
         ])
+        
+        prev_pose_data = pose_data
     
-    # Structural measurement statistics (now normalized)
-    for i in range(2):  # step_width and hip_width
-        features.extend([
-            float(np.mean(structural_measurements[:, i])),
-            float(np.std(structural_measurements[:, i]))
-        ])
-    
-    # Dynamic measurement statistics (without cadence)
-    for i in range(2):  # step_length and walking_speed
-        features.extend([
-            float(np.mean(dynamic_measurements[:, i])),
-            float(np.std(dynamic_measurements[:, i]))
-        ])
-    
-    # Symmetry statistics
-    features.extend([
-        float(np.mean(symmetry_scores)),
-        float(np.std(symmetry_scores))
-    ])
-    
-    # Add temporal features
-    temporal_features = analysis['temporal_features']
-    features.extend([
-        float(temporal_features['cycle_durations']['left']['mean']),
-        float(temporal_features['cycle_durations']['left']['std']),
-        float(temporal_features['cycle_durations']['right']['mean']),
-        float(temporal_features['cycle_durations']['right']['std'])
-    ])
-    
-    # Add dynamic features
-    dynamic_features = analysis['dynamic_features']
-    features.extend([
-        float(dynamic_features['step_lengths']['mean']),
-        float(dynamic_features['step_lengths']['std']),
-        float(dynamic_features['stride_lengths']['mean']),
-        float(dynamic_features['stride_lengths']['std'])
-    ])
-    
-    return np.array(features, dtype=np.float32)
+    # Convert to numpy array and average over the window
+    features = np.array(features)
+    return np.mean(features, axis=0)  # Average over the window dimension
 
-def create_embeddings(features: np.ndarray, subject_id: int, model) -> np.ndarray:
-    """Create embeddings from features using the neural network model with subject information."""
-    # Reshape features for the model (add batch dimension)
-    features = features.reshape(1, -1)
-    subject_id = np.array([subject_id])
-    
-    # Get embeddings from the model
-    embeddings = model.predict([features, subject_id])
-    return embeddings
 
-def analyze_similarities(embeddings: np.ndarray, k: int = 5) -> Dict:
-    """Analyze similarities between embeddings with enhanced subject-specific metrics."""
-    # Calculate cosine similarities (embeddings are already L2 normalized)
-    similarities = np.dot(embeddings, embeddings.T)
+def test_window_sizes(pose_dir: str, output_dir: str, window_sizes: List[int] = [50, 100, 150, 200, 250]) -> None:
+    """Test different window sizes and analyze their impact on feature extraction.
     
-    # Get top-k nearest neighbors for each embedding
-    k = min(k, len(embeddings))
-    nearest_neighbors = []
+    Args:
+        pose_dir: Directory containing pose data files.
+        output_dir: Directory to save the vector database.
+        window_sizes: List of window sizes to test (in frames at 100 FPS):
+            - 50 frames = 0.5 seconds (half step cycle)
+            - 100 frames = 1.0 seconds (one full step cycle)
+            - 150 frames = 1.5 seconds (one and a half step cycles)
+            - 200 frames = 2.0 seconds (two full step cycles)
+            - 250 frames = 2.5 seconds (two and a half step cycles)
+    """
+    # Create output directory for window size analysis
+    analysis_dir = os.path.join(output_dir, 'window_analysis')
+    os.makedirs(analysis_dir, exist_ok=True)
     
-    for i in range(len(embeddings)):
-        # Get indices of k nearest neighbors (excluding self)
-        indices = np.argsort(similarities[i])[-k-1:-1][::-1]
-        # Get similarity scores
-        scores = similarities[i][indices]
-        nearest_neighbors.append({
-            'indices': indices.tolist(),
-            'scores': scores.tolist()
-        })
-    
-    return {
-        'similarities': similarities.tolist(),
-        'nearest_neighbors': nearest_neighbors,
-        'mean_similarity': float(np.mean(similarities)),
-        'std_similarity': float(np.std(similarities))
+    # Initialize results storage
+    results = {
+        'window_sizes': [],
+        'num_sequences': [],
+        'feature_importance': [],
+        'feature_statistics': []
     }
-
-def visualize_embeddings(embeddings: np.ndarray, file_info: List[Dict], output_dir: Path) -> None:
-    """Visualize embeddings using t-SNE and save as PNG."""
-    # Extract subject IDs for coloring
-    subject_ids = [info['subject_id'] for info in file_info]
     
-    # Apply t-SNE to reduce dimensionality to 2D
-    print("Applying t-SNE to reduce dimensionality...")
-    tsne = TSNE(n_components=2, random_state=42, perplexity=30)
-    embeddings_2d = tsne.fit_transform(embeddings)
+    # Test each window size
+    for window_size in window_sizes:
+        print(f"\nTesting window size: {window_size}")
+        
+        # Create vector database with current window size
+        window_output_dir = os.path.join(output_dir, f'window_{window_size}')
+        features_tensor, metadata = create_vector_database(
+            pose_dir, 
+            window_output_dir,
+            window_size
+        )
+        
+        if features_tensor is None:
+            continue
+        
+        # Run feature analysis
+        print("Running feature analysis...")
+        from analyze_features import load_vector_database, calculate_feature_importance, calculate_feature_statistics
+        
+        # Calculate feature importance
+        importance_scores = calculate_feature_importance(features_tensor, metadata)
+        
+        # Calculate feature statistics
+        stats_df = calculate_feature_statistics(features_tensor)
+        
+        # Store results
+        results['window_sizes'].append(window_size)
+        results['num_sequences'].append(len(features_tensor))
+        results['feature_importance'].append(importance_scores)
+        results['feature_statistics'].append(stats_df)
+        
+        # Save individual window size results
+        window_analysis_dir = os.path.join(analysis_dir, f'window_{window_size}')
+        os.makedirs(window_analysis_dir, exist_ok=True)
+        
+        # Save importance scores
+        importance_df = pd.DataFrame({
+            'feature_index': range(len(importance_scores)),
+            'importance': importance_scores
+        })
+        importance_df.to_csv(os.path.join(window_analysis_dir, 'feature_importance.csv'), index=False)
+        
+        # Save statistics
+        stats_df.to_csv(os.path.join(window_analysis_dir, 'feature_statistics.csv'))
+        
+        # Generate plots
+        from analyze_features import plot_feature_distributions, plot_feature_correlations
+        plot_feature_distributions(features_tensor, window_analysis_dir)
+        plot_feature_correlations(features_tensor, window_analysis_dir)
     
-    # Create scatter plot
-    plt.figure(figsize=(12, 8))
+    # Plot comparative results
+    plt.figure(figsize=(15, 10))
     
-    # Plot points colored by subject
-    scatter = plt.scatter(embeddings_2d[:, 0], embeddings_2d[:, 1], 
-                         c=subject_ids, cmap='tab10', alpha=0.6)
+    # Plot 1: Number of sequences
+    plt.subplot(2, 2, 1)
+    plt.plot(results['window_sizes'], results['num_sequences'], 'bo-')
+    plt.xlabel('Window Size')
+    plt.ylabel('Number of Sequences')
+    plt.title('Sequences vs Window Size')
     
-    # Add legend
-    legend1 = plt.legend(*scatter.legend_elements(),
-                        loc="upper right", title="Subject")
-    plt.gca().add_artist(legend1)
+    # Plot 2: Feature importance comparison
+    plt.subplot(2, 2, 2)
+    for i in range(len(results['feature_importance'][0])):
+        importance = [imp[i] for imp in results['feature_importance']]
+        plt.plot(results['window_sizes'], importance, label=f'Feature {i}', alpha=0.7)
+    plt.xlabel('Window Size')
+    plt.ylabel('Feature Importance')
+    plt.title('Feature Importance vs Window Size')
+    plt.legend()
     
-    # Add title and labels
-    plt.title("t-SNE Visualization of Gait Embeddings")
-    plt.xlabel("t-SNE Dimension 1")
-    plt.ylabel("t-SNE Dimension 2")
+    # Plot 3: Feature means comparison
+    plt.subplot(2, 2, 3)
+    for i in range(len(results['feature_statistics'][0])):
+        means = [stats['mean'].iloc[i] for stats in results['feature_statistics']]
+        plt.plot(results['window_sizes'], means, label=f'Feature {i}', alpha=0.7)
+    plt.xlabel('Window Size')
+    plt.ylabel('Feature Mean')
+    plt.title('Feature Means vs Window Size')
+    plt.legend()
     
-    # Add grid
-    plt.grid(True, alpha=0.3)
+    # Plot 4: Feature stds comparison
+    plt.subplot(2, 2, 4)
+    for i in range(len(results['feature_statistics'][0])):
+        stds = [stats['std'].iloc[i] for stats in results['feature_statistics']]
+        plt.plot(results['window_sizes'], stds, label=f'Feature {i}', alpha=0.7)
+    plt.xlabel('Window Size')
+    plt.ylabel('Feature Standard Deviation')
+    plt.title('Feature Standard Deviations vs Window Size')
+    plt.legend()
     
-    # Save plot
-    plt.savefig(output_dir / "embeddings_visualization.png", dpi=300, bbox_inches='tight')
+    plt.tight_layout()
+    plt.savefig(os.path.join(analysis_dir, 'window_size_comparison.png'))
     plt.close()
     
-    print(f"Embedding visualization saved to {output_dir / 'embeddings_visualization.png'}")
+    # Save comprehensive results summary
+    with open(os.path.join(analysis_dir, 'results_summary.txt'), 'w') as f:
+        f.write("Window Size Analysis Results\n")
+        f.write("==========================\n\n")
+        
+        for i, window_size in enumerate(results['window_sizes']):
+            f.write(f"Window Size: {window_size}\n")
+            f.write(f"Number of Sequences: {results['num_sequences'][i]}\n")
+            
+            f.write("\nFeature Importance:\n")
+            for j, importance in enumerate(results['feature_importance'][i]):
+                f.write(f"  Feature {j}: {importance:.4f}\n")
+            
+            f.write("\nFeature Statistics:\n")
+            stats = results['feature_statistics'][i]
+            for j in range(len(stats)):
+                f.write(f"  Feature {j}:\n")
+                f.write(f"    Mean: {stats['mean'].iloc[j]:.4f}\n")
+                f.write(f"    Std: {stats['std'].iloc[j]:.4f}\n")
+                f.write(f"    Min: {stats['min'].iloc[j]:.4f}\n")
+                f.write(f"    Max: {stats['max'].iloc[j]:.4f}\n")
+            
+            f.write("\n" + "="*50 + "\n\n")
+    
+    print(f"\nWindow size analysis complete. Results saved to {analysis_dir}/")
 
-def save_feature_info(output_dir: Path) -> None:
-    """Save detailed information about the features being used."""
-    feature_info = {
-        "total_features": 30,
-        "feature_groups": [
-            {
-                "name": "Joint Angles",
-                "count": 12,
-                "features": [
-                    "Left Hip (mean, std)",
-                    "Right Hip (mean, std)",
-                    "Left Knee (mean, std)",
-                    "Right Knee (mean, std)",
-                    "Left Ankle (mean, std)",
-                    "Right Ankle (mean, std)"
-                ]
-            },
-            {
-                "name": "Structural Measurements",
-                "count": 4,
-                "features": [
-                    "Step Width (mean, std)",
-                    "Hip Width (mean, std)"
-                ]
-            },
-            {
-                "name": "Dynamic Measurements",
-                "count": 4,
-                "features": [
-                    "Step Length (mean, std)",
-                    "Walking Speed (mean, std)"
-                ]
-            },
-            {
-                "name": "Symmetry",
-                "count": 2,
-                "features": [
-                    "Symmetry Score (mean, std)"
-                ]
-            },
-            {
-                "name": "Temporal Features",
-                "count": 4,
-                "features": [
-                    "Left Cycle Duration (mean, std)",
-                    "Right Cycle Duration (mean, std)"
-                ]
-            },
-            {
-                "name": "Dynamic Features",
-                "count": 4,
-                "features": [
-                    "Step Lengths (mean, std)",
-                    "Stride Lengths (mean, std)"
-                ]
-            }
-        ],
-        "normalization": {
-            "subject_specific": [
-                "Step Width",
-                "Hip Width",
-                "Step Length"
-            ],
-            "global": [
-                "Joint Angles",
-                "Walking Speed",
-                "Symmetry",
-                "Cycle Durations"
-            ]
-        },
-        "excluded_features": [
-            "Cadence"
-        ]
-    }
-    
-    # Save feature information
-    with open(output_dir / "feature_info.json", 'w') as f:
-        json.dump(feature_info, f, indent=2)
-    
-    print(f"Feature information saved to {output_dir / 'feature_info.json'}")
 
-def create_vector_db(input_dir: str, output_dir: str, model) -> None:
-    """Create vector database from gait analysis data with subject-specific processing."""
-    # Create output directory
-    output_dir = Path(output_dir)
-    output_dir.mkdir(exist_ok=True)
+def calculate_feature_importance(features: torch.Tensor, metadata: List[Dict]) -> np.ndarray:
+    """Calculate feature importance scores using mutual information.
     
-    # Save feature information
-    save_feature_info(output_dir)
-    
-    # Load all gait analysis files
-    input_dir = Path(input_dir)
-    analysis_files = list(input_dir.glob("analysis_*.json"))
-    
-    if not analysis_files:
-        print(f"No gait analysis files found in {input_dir}")
-        return
-    
-    # Extract features and create embeddings
-    features_list = []
-    embeddings_list = []
-    file_info = []
-    
-    # Group files by subject
-    subject_files = {}
-    for file_path in analysis_files:
-        # Extract subject from filename (e.g., "analysis_converted_Sub9_Kinematics_T1.json")
-        parts = file_path.stem.split('_')
-        subject = parts[2]  # This will be "SubX"
-        if subject not in subject_files:
-            subject_files[subject] = []
-        subject_files[subject].append(file_path)
-    
-    # Process each subject's files
-    for subject, files in tqdm(subject_files.items(), desc="Processing subjects"):
-        # Extract subject ID (e.g., "Sub9" -> 9)
-        subject_id = int(subject.replace('Sub', ''))
+    Args:
+        features: Tensor of shape (n_samples, n_features)
+        metadata: List of metadata dictionaries
         
-        for file_path in tqdm(files, desc=f"Processing {subject}", leave=False):
-            try:
-                # Load analysis data
-                analysis = load_gait_analysis(str(file_path))
-                
-                # Extract features with subject-specific normalization
-                features = extract_features(analysis, subject)
-                
-                # Verify feature dimension
-                if features.shape[0] != 30:
-                    print(f"Warning: Skipping {file_path} - incorrect feature dimension: {features.shape[0]}")
-                    continue
-                    
-                features_list.append(features)
-                
-                # Create embeddings with subject information
-                embeddings = create_embeddings(features, subject_id, model)
-                embeddings_list.append(embeddings)
-                
-                # Store file info with more details
-                file_info.append({
-                    'file_path': str(file_path),
-                    'subject': subject,
-                    'subject_id': subject_id,
-                    'trial': file_path.stem.split('_')[-1],
-                    'timestamp': datetime.now().isoformat()
-                })
-            except Exception as e:
-                print(f"Error processing {file_path}: {str(e)}")
-                continue
+    Returns:
+        Array of feature importance scores
+    """
+    # Extract subject IDs from metadata
+    subject_ids = [m['subject_id'] for m in metadata]
     
-    if not features_list:
-        print("No valid features extracted")
-        return
+    # Convert features to numpy array
+    X = features.cpu().numpy()
+    y = np.array(subject_ids)
     
-    # Convert lists to numpy arrays
-    features_array = np.vstack(features_list)
-    embeddings_array = np.vstack(embeddings_list)
+    # Calculate mutual information scores
+    mi_scores = mutual_info_classif(X, y)
     
-    # Create FAISS index with cosine similarity
-    dimension = embeddings_array.shape[1]
-    index = faiss.IndexFlatIP(dimension)  # Using inner product for cosine similarity
-    index.add(embeddings_array.astype('float32'))
+    # Normalize scores to sum to 1
+    mi_scores = mi_scores / mi_scores.sum()
     
-    # Save index and metadata
-    faiss.write_index(index, str(output_dir / "gait_index.faiss"))
-    
-    # Save file info
-    with open(output_dir / "file_info.json", 'w') as f:
-        json.dump(file_info, f, indent=2)
-    
-    # Analyze similarities with subject-specific metrics
-    similarities = analyze_similarities(embeddings_array)
-    
-    # Save similarity analysis
-    with open(output_dir / "similarity_analysis.json", 'w') as f:
-        json.dump(similarities, f, indent=2)
-    
-    # Calculate and save accuracy metrics
-    accuracy_metrics = calculate_accuracy_metrics(similarities, file_info)
-    with open(output_dir / "accuracy_metrics.json", 'w') as f:
-        json.dump(accuracy_metrics, f, indent=2)
-    
-    # Save subject-specific statistics
-    subject_stats = calculate_subject_stats(embeddings_array, file_info)
-    with open(output_dir / "subject_stats.json", 'w') as f:
-        json.dump(subject_stats, f, indent=2)
-    
-    # Visualize and save embeddings
-    visualize_embeddings(embeddings_array, file_info, output_dir)
-    
-    print(f"Vector database created successfully in {output_dir}")
-    print(f"Total embeddings: {len(embeddings_array)}")
-    print(f"Embedding dimension: {dimension}")
-    print(f"Feature dimension: {features_array.shape[1]}")
-    print(f"Number of subjects: {len(subject_files)}")
+    return mi_scores
 
-def calculate_accuracy_metrics(similarities: Dict, file_info: List[Dict]) -> Dict:
-    """Calculate accuracy metrics for the similarity analysis."""
-    # Extract subject IDs
-    subjects = [info['subject'] for info in file_info]
+
+def calculate_feature_statistics(features: torch.Tensor) -> List[Dict]:
+    """Calculate statistics for each feature.
     
-    # Calculate metrics for each embedding
-    metrics = []
-    for i, neighbors in enumerate(similarities['nearest_neighbors']):
-        # Get subject of current embedding
-        current_subject = subjects[i]
+    Args:
+        features: Tensor of shape (n_samples, n_features)
         
-        # Get subjects of neighbors
-        neighbor_subjects = [subjects[idx] for idx in neighbors['indices']]
-        
-        # Calculate match confidence (percentage of neighbors with same subject)
-        match_confidence = sum(1 for s in neighbor_subjects if s == current_subject) / len(neighbor_subjects)
-        
-        # Calculate similarity confidence (average similarity score)
-        similarity_confidence = np.mean(neighbors['scores'])
-        
-        # Combined confidence (weighted average)
-        combined_confidence = 0.7 * match_confidence + 0.3 * similarity_confidence
-        
-        metrics.append({
-            'index': i,
-            'subject': current_subject,
-            'match_confidence': float(match_confidence),
-            'similarity_confidence': float(similarity_confidence),
-            'combined_confidence': float(combined_confidence)
+    Returns:
+        List of dictionaries containing statistics for each feature
+    """
+    # Convert features to numpy array
+    X = features.cpu().numpy()
+    
+    # Calculate statistics for each feature
+    stats = []
+    for i in range(X.shape[1]):
+        feature = X[:, i]
+        stats.append({
+            'mean': np.mean(feature),
+            'std': np.std(feature),
+            'min': np.min(feature),
+            'max': np.max(feature)
         })
-    
-    # Calculate overall metrics
-    match_accuracies = [m['match_confidence'] for m in metrics]
-    similarity_confidences = [m['similarity_confidence'] for m in metrics]
-    combined_confidences = [m['combined_confidence'] for m in metrics]
-    
-    return {
-        'match_accuracy': {
-            'mean': float(np.mean(match_accuracies)),
-            'std': float(np.std(match_accuracies))
-        },
-        'similarity_confidence': {
-            'mean': float(np.mean(similarity_confidences)),
-            'std': float(np.std(similarity_confidences))
-        },
-        'combined_confidence': {
-            'mean': float(np.mean(combined_confidences)),
-            'std': float(np.std(combined_confidences))
-        },
-        'detailed_metrics': metrics
-    }
-
-def calculate_subject_stats(embeddings: np.ndarray, file_info: List[Dict]) -> Dict:
-    """Calculate subject-specific statistics for the embeddings."""
-    # Group embeddings by subject
-    subject_embeddings = {}
-    for i, info in enumerate(file_info):
-        subject = info['subject']
-        if subject not in subject_embeddings:
-            subject_embeddings[subject] = []
-        subject_embeddings[subject].append(embeddings[i])
-    
-    # Calculate statistics for each subject
-    stats = {}
-    for subject, emb_list in subject_embeddings.items():
-        emb_array = np.array(emb_list)
-        stats[subject] = {
-            'num_samples': len(emb_array),
-            'mean_embedding': emb_array.mean(axis=0).tolist(),
-            'std_embedding': emb_array.std(axis=0).tolist(),
-            'intra_subject_similarity': float(np.mean(np.dot(emb_array, emb_array.T)))
-        }
     
     return stats
 
-def create_model(input_dim: int = 30, embedding_dim: int = 128, num_subjects: int = 10) -> Model:
-    """Create and compile the neural network model for subject identification."""
-    # Input layers
-    feature_input = Input(shape=(input_dim,))
-    subject_input = Input(shape=(1,), dtype='int32')
-    
-    # Subject embedding layer (increased dimension for better discrimination)
-    subject_embedding = Embedding(num_subjects, 32)(subject_input)
-    subject_embedding = Flatten()(subject_embedding)
-    
-    # Feature processing with increased capacity
-    x = Dense(512, activation='relu')(feature_input)
-    x = BatchNormalization()(x)
-    x = Dropout(0.3)(x)
-    
-    # Combine with subject embedding
-    x = Concatenate()([x, subject_embedding])
-    
-    # Additional layers for better feature extraction
-    x = Dense(256, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.3)(x)
-    
-    x = Dense(192, activation='relu')(x)
-    x = BatchNormalization()(x)
-    x = Dropout(0.3)(x)
-    
-    # Final embedding layer with L2 normalization
-    outputs = Dense(embedding_dim, activation='linear')(x)
-    outputs = tf.keras.layers.Lambda(lambda x: tf.nn.l2_normalize(x, axis=1))(outputs)
-    
-    # Create model
-    model = Model(inputs=[feature_input, subject_input], outputs=outputs)
-    
-    # Compile model with triplet loss
-    model.compile(
-        optimizer=Adam(learning_rate=0.0001),
-        loss='mse',
-        metrics=['mae']
-    )
-    
-    return model
 
-def main():
-    # Define directories
-    input_dir = "gait_analysis"
-    output_dir = "vector_db"
+def create_vector_database(pose_dir: str, output_dir: str, window_size: int = 60) -> Tuple[torch.Tensor, List[Dict], StandardScaler]:
+    """Create a vector database from pose data files.
     
-    # Create and train the model
-    model = create_model()
+    Args:
+        pose_dir: Directory containing pose data files.
+        output_dir: Directory to save the vector database.
+        window_size: Size of the sliding window for feature extraction.
+        
+    Returns:
+        Tuple containing the features tensor, metadata, and scaler.
+    """
+    # Create output directory
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Create vector database
-    create_vector_db(input_dir, output_dir, model)
+    # Get list of pose files
+    pose_files = [f for f in os.listdir(pose_dir) if f.endswith('.json')]
+    print(f"Found {len(pose_files)} pose files to process")
+    
+    # Initialize lists for features and metadata
+    all_features = []
+    metadata = []
+    
+    # Process each file
+    for file_name in tqdm(pose_files, desc="Processing files"):
+        file_path = os.path.join(pose_dir, file_name)
+        
+        try:
+            # Load gait analysis data
+            gait_data = load_gait_analysis(file_path)
+            
+            # Get pose landmarks
+            pose_landmarks = gait_data.get('pose_landmarks', [])
+            if not pose_landmarks:
+                print(f"Warning: No pose landmarks found in {file_name}")
+                continue
+            
+            # Process each window
+            for i in range(0, len(pose_landmarks), window_size):
+                window = pose_landmarks[i:i + window_size]
+                if len(window) < window_size:
+                    continue
+                
+                # Extract features for this window
+                window_features = extract_gait_features_batch(window)
+                
+                # Store features and metadata
+                all_features.append(window_features)
+                metadata.append({
+                    'file': file_name,
+                    'start_frame': i,
+                    'end_frame': i + window_size
+                })
+                
+                # Clear memory periodically
+                if len(all_features) % 1000 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+        
+        except Exception as e:
+            print(f"Error processing {file_name}: {str(e)}")
+            continue
+    
+    if not all_features:
+        print("No features were extracted. Please check the input data and try again.")
+        return None, [], None
+    
+    # Convert features to numpy array
+    all_features = np.array(all_features)
+    
+    # Normalize features
+    scaler = StandardScaler()
+    all_features = scaler.fit_transform(all_features)
+    
+    # Convert to tensor
+    features_tensor = torch.tensor(all_features, dtype=torch.float32)
+    
+    # Save vector database
+    torch.save(features_tensor, os.path.join(output_dir, 'gait_features.pt'))
+    with open(os.path.join(output_dir, 'metadata.pkl'), 'wb') as f:
+        pickle.dump(metadata, f)
+    with open(os.path.join(output_dir, 'scaler.pkl'), 'wb') as f:
+        pickle.dump(scaler, f)
+    
+    print(f"Vector database created with {len(features_tensor)} sequences")
+    return features_tensor, metadata, scaler
+
 
 if __name__ == "__main__":
-    main() 
+    pose_dir = "converted_poses"
+    output_dir = "vector_db"
+    
+    # Test different window sizes
+    test_window_sizes(pose_dir, output_dir) 
