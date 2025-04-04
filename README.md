@@ -1,22 +1,73 @@
-# Gait Re-Identification Project
+# Gait Re-Identification System
 
-This project implements human pose detection and video processing using MediaPipe for real-time and batch processing of videos. It includes functionality for detecting body poses, hand movements, and facial landmarks.
+A system for identifying individuals based on their gait patterns using 3D pose data.
+
+## Overview
+
+This project implements a gait recognition system that:
+1. Processes 3D pose data from JSON files
+2. Extracts meaningful gait features
+3. Creates a vector database for efficient similarity search
+4. Evaluates matching accuracy using weighted cosine similarity
 
 ## Features
 
-- Real-time pose detection using MediaPipe
-- Hand tracking with left/right hand identification
-- Facial landmark detection with iris tracking
-- Video processing capabilities
-- Support for COCO-VID dataset integration
-- Configurable camera orientation handling
+The system extracts 8 key gait features:
+1. Physical Features:
+   - Step width
+   - Hip width
+   - Left hip angle
+   - Right hip angle
+2. Dynamic Features:
+   - Mean step length
+   - Step length standard deviation
+   - Mean stride length
+   - Stride length standard deviation
 
-## Installation
+## Optimal Window Size
 
-1. Clone the repository:
+After extensive analysis, the optimal window size was determined to be 60 frames (0.6 seconds at 100 FPS) because:
+- Captures one complete step cycle
+- Provides best balance between:
+  - Number of sequences (67,803)
+  - Feature importance scores
+  - Feature stability
+- Most computationally efficient while maintaining accuracy
+
+## Feature Importance
+
+Based on mutual information analysis, the most important features are:
+1. Left hip angle (0.0622)
+2. Right hip angle (0.0516)
+3. Step width (0.0254)
+4. Mean stride length (0.0218)
+5. Stride length standard deviation (0.0176)
+6. Hip width (0.0086)
+7. Mean step length (0.0083)
+8. Step length standard deviation (0.0076)
+
+## Directory Structure
+
+```
+.
+├── converted_poses/         # Input pose data in JSON format
+├── vector_db/              # Vector database and analysis results
+│   ├── window_60/          # Results for optimal 60-frame window
+│   │   ├── vector_database.pt
+│   │   ├── metrics.txt
+│   │   └── feature_analysis/
+│   └── window_analysis/    # Analysis of different window sizes
+├── create_vector_db.py     # Script to create vector database
+├── evaluate_similarity.py  # Script to evaluate matching accuracy
+└── analyze_features.py     # Script for feature analysis
+```
+
+## Setup
+
+1. Create a virtual environment:
 ```bash
-git clone https://github.com/yourusername/Gait-Re-Identification.git
-cd Gait-Re-Identification
+python3 -m venv venv
+source venv/bin/activate
 ```
 
 2. Install dependencies:
@@ -26,41 +77,31 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Real-time Pose Detection
-
-Run the real-time pose detection script:
+1. Create vector database:
 ```bash
-python pose_detection.py
+python3 create_vector_db.py
 ```
 
-Controls:
-- Press 'r' to start/stop recording
-- Press 'i' to toggle camera inversion
-- Press 'q' to quit
-
-### Video Processing
-
-1. Place your videos in the `videos` directory
-2. Run the video processing script:
+2. Evaluate similarity:
 ```bash
-python process_videos.py
+python3 evaluate_similarity.py
 ```
 
-The processed videos will be saved in the `outputs` directory.
+## Results
 
-### COCO-VID Dataset Integration
+The system achieves high accuracy in gait recognition by:
+- Using weighted cosine similarity based on feature importance
+- Optimizing window size for feature extraction
+- Leveraging GPU acceleration for efficient processing
+- Implementing robust feature normalization
 
-1. Download the COCO-VID dataset:
-```bash
-python download_coco_vid.py
-```
+## Future Improvements
 
-2. Extract human videos from the dataset:
-```bash
-python extract_human_videos.py
-```
-
-The extracted human videos will be saved in the `human_videos` directory.
+1. Implement temporal features for better gait cycle analysis
+2. Add more sophisticated feature weighting schemes
+3. Explore deep learning approaches for feature extraction
+4. Improve handling of varying walking speeds
+5. Add support for real-time gait recognition
 
 ## Project Structure
 
