@@ -388,8 +388,13 @@ def calculate_feature_importance(features: torch.Tensor, metadata: List[Dict]) -
     Returns:
         Array of feature importance scores
     """
-    # Extract subject IDs from metadata
-    subject_ids = [m['subject_id'] for m in metadata]
+    # Extract subject IDs from file paths
+    subject_ids = []
+    for m in metadata:
+        # Extract subject ID from file path (e.g., "subject_001_walk_01.json" -> "001")
+        file_name = os.path.basename(m['file'])
+        subject_id = file_name.split('_')[1]  # Get the number part
+        subject_ids.append(subject_id)
     
     # Convert features to numpy array
     X = features.cpu().numpy()
