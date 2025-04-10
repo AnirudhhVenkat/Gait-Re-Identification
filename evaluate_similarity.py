@@ -16,6 +16,7 @@ from plotly.subplots import make_subplots
 import heapq
 from collections import defaultdict
 from create_vector_db import create_vector_database, calculate_feature_importance, calculate_feature_statistics
+from sklearn.metrics import precision_recall_fscore_support
 
 # Set device and maximize GPU usage
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -32,255 +33,268 @@ if device.type == 'cuda':
     print(f"Total GPU memory: {total_memory / 1024**3:.2f} GB")
     print(f"Free GPU memory: {(total_memory - free_memory) / 1024**3:.2f} GB")
 
-def load_vector_database(db_dir: str) -> Tuple[torch.Tensor, List[Dict], StandardScaler]:
-    """Load the vector database components."""
-    features_path = os.path.join(db_dir, 'gait_features.pt')
-    metadata_path = os.path.join(db_dir, 'metadata.pkl')
-    scaler_path = os.path.join(db_dir, 'scaler.pkl')
-    
-    # Load features directly to GPU
-    features = torch.load(features_path, map_location=device)
-    with open(metadata_path, 'rb') as f:
-        metadata = pickle.load(f)
-    with open(scaler_path, 'rb') as f:
-        scaler = pickle.load(f)
-    
-    return features, metadata, scaler
+def extract_subject_id(file_name: str) -> str:
+    """Extract subject ID from file name (e.g., 'S01' from 'converted_Sub1_Kinematics_T7.json')."""
+    # Extract the subject number from the filename
+    # Format: converted_Sub1_Kinematics_T7.json -> S01
+    parts = file_name.split('_')
+    if len(parts) >= 2 and parts[1].startswith('Sub'):
+        # Extract the number from "Sub1", "Sub2", etc.
+        sub_num = parts[1][3:]  # Remove "Sub" prefix
+        if sub_num.isdigit():
+            # Format as S01, S02, etc.
+            return f"S{int(sub_num):02d}"
+    raise ValueError(f"Invalid subject ID in filename: {file_name}")
 
-def extract_subject_id(filename: str) -> str:
-    """Extract subject ID from filename."""
-    parts = filename.split('_')
-    return parts[1] if len(parts) > 1 else filename
-
-def select_features(features: torch.Tensor, metadata: List[Dict], n_features: int = 50) -> Tuple[torch.Tensor, List[int]]:
-    """Select the most discriminative features using mutual information."""
-    # Get subject labels
-    labels = [extract_subject_id(m['file']) for m in metadata]
-    unique_labels = list(set(labels))
-    label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
-    y = np.array([label_to_idx[label] for label in labels])
-    
-    # Convert features to numpy for feature selection
-    X = features.cpu().numpy()
-    
-    # Select top features using mutual information
-    selector = SelectKBest(score_func=mutual_info_classif, k=n_features)
-    selector.fit(X, y)
-    selected_indices = selector.get_support(indices=True)
-    
-    # Return selected features and their indices
-    return features[:, selected_indices], selected_indices
-
-def normalize_features(features: torch.Tensor) -> torch.Tensor:
-    """Normalize features using robust scaling."""
-    # Convert to numpy for scaling
-    X = features.cpu().numpy()
-    
-    # Apply robust scaling
-    scaler = RobustScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    # Convert back to tensor and move to device
-    return torch.tensor(X_scaled, dtype=torch.float32, device=device)
-
-def find_top_k_matches_gpu_optimized(query_features: torch.Tensor, 
-                                   database_features: torch.Tensor,
-                                   metadata: List[Dict], 
-                                   k: int = 5, 
-                                   batch_size: int = 1024) -> List[List[Dict]]:
-    """Find top-k matches using GPU-optimized approach with weighted cosine similarity.
-    Features used (with importance weights):
-    0. Step width (0.0254)
-    1. Hip width (0.0086)
-    2. Left hip angle (0.0622)
-    3. Right hip angle (0.0516)
-    4. Mean step length (0.0083)
-    5. Step length std dev (0.0076)
-    6. Mean stride length (0.0218)
-    7. Stride length std dev (0.0176)
-    """
-    n_queries = len(query_features)
-    results = []
-    
-    # Feature importance weights based on analysis
-    weights = torch.tensor([
-        0.0254,  # Step width
-        0.0086,  # Hip width
-        0.0622,  # Left hip angle (most important)
-        0.0516,  # Right hip angle
-        0.0083,  # Mean step length
-        0.0076,  # Step length std dev
-        0.0218,  # Mean stride length
-        0.0176   # Stride length std dev
-    ], device=device)
-    
-    # Normalize weights to sum to 1
-    weights = weights / weights.sum()
-    
-    # Calculate optimal batch size
-    if device.type == 'cuda':
-        available_memory = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
-        memory_per_query = database_features.element_size() * database_features.shape[1] * 2
-        optimal_batch_size = min(batch_size, available_memory // memory_per_query)
-        print(f"Using batch size: {optimal_batch_size}")
-    else:
-        optimal_batch_size = batch_size
-    
-    # Process queries in batches
-    for i in tqdm(range(0, n_queries, optimal_batch_size), desc="Processing queries"):
-        batch_end = min(i + optimal_batch_size, n_queries)
-        query_batch = query_features[i:batch_end]
+def load_vector_database(vector_db_dir: str) -> tuple:
+    """Load vector database components."""
+    try:
+        # Load training data
+        train_features = torch.load(os.path.join(vector_db_dir, 'train_features.pt'))
+        with open(os.path.join(vector_db_dir, 'train_metadata.pkl'), 'rb') as f:
+            train_metadata = pickle.load(f)
         
-        # Apply feature weights
-        query_weighted = query_batch * weights
-        db_weighted = database_features * weights
+        # Load test data
+        test_features = torch.load(os.path.join(vector_db_dir, 'test_features.pt'))
+        with open(os.path.join(vector_db_dir, 'test_metadata.pkl'), 'rb') as f:
+            test_metadata = pickle.load(f)
         
-        # Normalized weighted cosine similarity
-        query_norm = torch.nn.functional.normalize(query_weighted, p=2, dim=1)
-        db_norm = torch.nn.functional.normalize(db_weighted, p=2, dim=1)
-        batch_similarity = torch.mm(query_norm, db_norm.t())
+        # Load scaler
+        with open(os.path.join(vector_db_dir, 'scaler.pkl'), 'rb') as f:
+            scaler = pickle.load(f)
         
+        # Validate data
+        if len(train_features) == 0 or len(test_features) == 0:
+            raise ValueError("Empty feature tensors found")
+        
+        if len(train_metadata['subject_ids']) != len(train_features):
+            raise ValueError("Mismatch between training features and metadata")
+        
+        if len(test_metadata['subject_ids']) != len(test_features):
+            raise ValueError("Mismatch between test features and metadata")
+        
+        # Verify subject IDs
+        train_subjects = set(train_metadata['subject_ids'])
+        test_subjects = set(test_metadata['subject_ids'])
+        
+        if not train_subjects or not test_subjects:
+            raise ValueError("No subject IDs found in metadata")
+        
+        print(f"Training subjects: {sorted(train_subjects)}")
+        print(f"Test subjects: {sorted(test_subjects)}")
+        print(f"Training samples per subject: {pd.Series(train_metadata['subject_ids']).value_counts().to_dict()}")
+        print(f"Test samples per subject: {pd.Series(test_metadata['subject_ids']).value_counts().to_dict()}")
+        
+        return train_features, train_metadata, test_features, test_metadata, scaler
+        
+    except FileNotFoundError as e:
+        raise FileNotFoundError(f"Required file not found in {vector_db_dir}: {str(e)}")
+    except Exception as e:
+        raise RuntimeError(f"Error loading vector database: {str(e)}")
+
+def calculate_similarity_matrix(train_features: torch.Tensor, 
+                             test_features: torch.Tensor) -> torch.Tensor:
+    """Calculate cosine similarity matrix between test and training feature vectors."""
+    # Validate input tensors
+    if train_features.dim() != 2 or test_features.dim() != 2:
+        raise ValueError("Input tensors must be 2D")
+    
+    if train_features.size(1) != test_features.size(1):
+        raise ValueError("Feature dimensions must match")
+    
+    # Normalize features
+    train_features_norm = train_features / train_features.norm(dim=1, keepdim=True)
+    test_features_norm = test_features / test_features.norm(dim=1, keepdim=True)
+    
+    # Calculate similarity matrix
+    similarity_matrix = torch.mm(test_features_norm, train_features_norm.t())
+    
+    # Validate output
+    if similarity_matrix.size(0) != test_features.size(0) or similarity_matrix.size(1) != train_features.size(0):
+        raise ValueError("Invalid similarity matrix dimensions")
+    
+    return similarity_matrix
+
+def evaluate_matches(similarity_matrix: torch.Tensor, 
+                    test_subject_ids: np.ndarray,
+                    train_subject_ids: np.ndarray,
+                    top_k_values: list = [1, 5, 10]) -> dict:
+    """Evaluate match accuracy for different top-k values."""
+    results = {}
+    
+    # Get indices of top-k matches for each test sample
+    _, top_k_indices = torch.topk(similarity_matrix, max(top_k_values), dim=1)
+    
+    for k in top_k_values:
         # Get top-k matches
-        batch_top_k_values, batch_top_k_indices = torch.topk(batch_similarity, k=min(k, batch_similarity.shape[1]), dim=1)
+        top_k_matches = top_k_indices[:, :k]
         
-        # Process results
-        for j in range(len(query_batch)):
-            matches = []
-            for l in range(k):
-                idx = batch_top_k_indices[j][l].item()
-                matches.append({
-                    'index': idx,
-                    'similarity': batch_top_k_values[j][l].item(),
-                    'subject_id': extract_subject_id(metadata[idx]['file']),
-                    'file': metadata[idx]['file'],
-                    'start_frame': metadata[idx]['start_frame'],
-                    'end_frame': metadata[idx]['end_frame']
-                })
-            results.append(matches)
+        # Check if correct subject is in top-k matches
+        correct_matches = np.array([
+            test_subject_ids[i] in train_subject_ids[top_k_matches[i]]
+            for i in range(len(test_subject_ids))
+        ])
         
-        # Clear memory
-        del batch_similarity, batch_top_k_values, batch_top_k_indices
-        torch.cuda.empty_cache()
+        # Calculate accuracy (same as recall for this task)
+        accuracy = np.mean(correct_matches)
+        
+        # For precision, we need to count how many of the top-k matches are correct
+        # For each test sample, count how many of its k matches are correct
+        true_positives = np.sum([
+            np.sum(test_subject_ids[i] == train_subject_ids[top_k_matches[i]])
+            for i in range(len(test_subject_ids))
+        ])
+        
+        # Total predictions made = number of test samples * k
+        total_predictions = len(test_subject_ids) * k
+        
+        # Calculate metrics
+        precision = true_positives / total_predictions if total_predictions > 0 else 0
+        recall = accuracy  # In this case, recall is the same as accuracy
+        f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+        
+        # Calculate per-subject accuracy
+        subject_accuracies = {}
+        for subject_id in set(test_subject_ids):
+            subject_mask = test_subject_ids == subject_id
+            if np.any(subject_mask):
+                subject_acc = np.mean(correct_matches[subject_mask])
+                subject_accuracies[subject_id] = subject_acc
+        
+        results[k] = {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'subject_accuracies': subject_accuracies
+        }
     
     return results
 
-def evaluate_matching_accuracy(results: List[List[Dict]], query_metadata: List[Dict]) -> Dict:
-    """Evaluate matching accuracy metrics."""
-    true_subjects = [extract_subject_id(m['file']) for m in query_metadata]
-    predicted_subjects = [r[0]['subject_id'] for r in results]  # Top-1 prediction
+def plot_results(results: dict, output_dir: str) -> None:
+    """Plot evaluation results."""
+    os.makedirs(output_dir, exist_ok=True)
     
-    accuracy = accuracy_score(true_subjects, predicted_subjects)
-    precision = precision_score(true_subjects, predicted_subjects, average='weighted')
-    recall = recall_score(true_subjects, predicted_subjects, average='weighted')
-    f1 = f1_score(true_subjects, predicted_subjects, average='weighted')
-    
-    # Calculate confusion matrix
-    cm = confusion_matrix(true_subjects, predicted_subjects)
-    
-    return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1_score': f1,
-        'confusion_matrix': cm
-    }
-
-def plot_similarity_distribution(results: List[List[Dict]], output_dir: str):
-    """Plot distribution of similarity scores."""
-    similarities = [r[0]['similarity'] for r in results]  # Top-1 similarity scores
-    
+    # Plot accuracy vs top-k
     plt.figure(figsize=(10, 6))
-    sns.histplot(similarities, kde=True)
-    plt.title('Distribution of Top-1 Similarity Scores')
-    plt.xlabel('Cosine Similarity')
-    plt.ylabel('Count')
-    plt.savefig(os.path.join(output_dir, 'similarity_distribution.png'))
+    k_values = list(results.keys())
+    accuracies = [results[k]['accuracy'] for k in k_values]
+    
+    plt.plot(k_values, accuracies, 'bo-')
+    plt.xlabel('Top-k')
+    plt.ylabel('Accuracy')
+    plt.title('Top-k Match Accuracy (Test vs Training)')
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, 'accuracy_vs_topk.png'))
+    plt.close()
+    
+    # Plot precision, recall, and F1 scores
+    plt.figure(figsize=(10, 6))
+    metrics = ['precision', 'recall', 'f1']
+    for metric in metrics:
+        values = [results[k][metric] for k in k_values]
+        plt.plot(k_values, values, label=metric.capitalize())
+    
+    plt.xlabel('Top-k')
+    plt.ylabel('Score')
+    plt.title('Precision, Recall, and F1 Scores (Test vs Training)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(output_dir, 'metrics_vs_topk.png'))
+    plt.close()
+    
+    # Plot per-subject accuracy
+    plt.figure(figsize=(12, 6))
+    subjects = sorted(set().union(*[set(results[k]['subject_accuracies'].keys()) for k in k_values]))
+    x = np.arange(len(subjects))
+    width = 0.25
+    
+    for i, k in enumerate(k_values):
+        accuracies = [results[k]['subject_accuracies'].get(subj, 0) for subj in subjects]
+        plt.bar(x + i*width, accuracies, width, label=f'Top-{k}')
+    
+    plt.xlabel('Subject')
+    plt.ylabel('Accuracy')
+    plt.title('Per-Subject Accuracy for Different Top-k Values')
+    plt.xticks(x + width, subjects)
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'subject_accuracy.png'))
     plt.close()
 
-def plot_confusion_matrix(cm: np.ndarray, output_dir: str):
-    """Plot confusion matrix."""
-    plt.figure(figsize=(12, 10))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
-    plt.title('Confusion Matrix')
-    plt.xlabel('Predicted Subject')
-    plt.ylabel('True Subject')
-    plt.savefig(os.path.join(output_dir, 'confusion_matrix.png'))
-    plt.close()
+def save_results(results: dict, output_dir: str) -> None:
+    """Save evaluation results to a text file."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    with open(os.path.join(output_dir, 'evaluation_results.txt'), 'w') as f:
+        f.write("Gait Re-Identification Evaluation Results (Test vs Training)\n")
+        f.write("========================================================\n\n")
+        
+        for k, metrics in results.items():
+            f.write(f"Top-{k} Results:\n")
+            f.write(f"  Overall Accuracy: {metrics['accuracy']:.4f}\n")
+            f.write(f"  Precision: {metrics['precision']:.4f}\n")
+            f.write(f"  Recall: {metrics['recall']:.4f}\n")
+            f.write(f"  F1 Score: {metrics['f1']:.4f}\n")
+            
+            f.write("\n  Per-Subject Accuracy:\n")
+            for subject_id, acc in sorted(metrics['subject_accuracies'].items()):
+                f.write(f"    Subject {subject_id}: {acc:.4f}\n")
+            f.write("\n")
+        
+        # Add summary statistics
+        f.write("\nSummary Statistics:\n")
+        f.write("-----------------\n")
+        f.write(f"Total Subjects: {len(set().union(*[set(results[k]['subject_accuracies'].keys()) for k in results.keys()]))}\n")
+        f.write(f"Best Top-1 Subject: {max(results[1]['subject_accuracies'].items(), key=lambda x: x[1])[0]} ({max(results[1]['subject_accuracies'].values()):.4f})\n")
+        f.write(f"Worst Top-1 Subject: {min(results[1]['subject_accuracies'].items(), key=lambda x: x[1])[0]} ({min(results[1]['subject_accuracies'].values()):.4f})\n")
+        f.write(f"Average Top-1 Accuracy: {np.mean(list(results[1]['subject_accuracies'].values())):.4f}\n")
+        f.write(f"Standard Deviation: {np.std(list(results[1]['subject_accuracies'].values())):.4f}\n")
 
 def main():
     # Set up paths
-    pose_dir = "converted_poses"
-    vector_db_path = "vector_db/window_60/vector_database.pt"
-    metrics_path = "vector_db/window_60/metrics.txt"
+    vector_db_dir = "vector_db"
+    output_dir = "evaluation_results"
     
-    # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(vector_db_path), exist_ok=True)
-    
-    # Load or create vector database
-    if os.path.exists(vector_db_path):
-        print("Loading existing vector database...")
-        vector_db = torch.load(vector_db_path)
-        features = vector_db['features']
-        metadata = vector_db['metadata']
-        scaler = vector_db['scaler']
-    else:
-        print("Creating new vector database...")
-        features, metadata, scaler = create_vector_database(pose_dir, os.path.dirname(vector_db_path), window_size=60)
-        vector_db = {
-            'features': features,
-            'metadata': metadata,
-            'scaler': scaler
-        }
-        torch.save(vector_db, vector_db_path)
-    
-    # Print database statistics
-    print(f"\nDatabase Statistics:")
-    print(f"Number of sequences: {len(metadata)}")
-    print(f"Feature dimension: {features.shape[1]}")
-    print(f"Window size: 60 frames (0.6 seconds at 100 FPS)")
-    
-    # Calculate feature importance
-    print("\nCalculating feature importance...")
-    importance_scores = calculate_feature_importance(features, metadata)
-    
-    # Print feature importance
-    print("\nFeature Importance Scores:")
-    for i, score in enumerate(importance_scores):
-        print(f"Feature {i}: {score:.4f}")
-    
-    # Calculate feature statistics
-    print("\nCalculating feature statistics...")
-    feature_stats = calculate_feature_statistics(features)
-    
-    # Print feature statistics
-    print("\nFeature Statistics:")
-    for i, stats in enumerate(feature_stats):
-        print(f"Feature {i}:")
-        print(f"  Mean: {stats['mean']:.4f}")
-        print(f"  Std: {stats['std']:.4f}")
-        print(f"  Min: {stats['min']:.4f}")
-        print(f"  Max: {stats['max']:.4f}")
-    
-    # Save metrics
-    with open(metrics_path, 'w') as f:
-        f.write("Gait Recognition System Metrics\n")
-        f.write("=============================\n\n")
-        f.write(f"Database Statistics:\n")
-        f.write(f"Number of sequences: {len(metadata)}\n")
-        f.write(f"Feature dimension: {features.shape[1]}\n")
-        f.write(f"Window size: 60 frames (0.6 seconds at 100 FPS)\n\n")
-        f.write("Feature Importance Scores:\n")
-        for i, score in enumerate(importance_scores):
-            f.write(f"Feature {i}: {score:.4f}\n")
-        f.write("\nFeature Statistics:\n")
-        for i, stats in enumerate(feature_stats):
-            f.write(f"Feature {i}:\n")
-            f.write(f"  Mean: {stats['mean']:.4f}\n")
-            f.write(f"  Std: {stats['std']:.4f}\n")
-            f.write(f"  Min: {stats['min']:.4f}\n")
-            f.write(f"  Max: {stats['max']:.4f}\n")
-    
-    print(f"\nMetrics saved to {metrics_path}")
+    try:
+        # Load vector database
+        print("Loading vector database...")
+        train_features, train_metadata, test_features, test_metadata, scaler = load_vector_database(vector_db_dir)
+        
+        print(f"Training samples: {len(train_features)}")
+        print(f"Test samples: {len(test_features)}")
+        
+        # Calculate similarity matrix
+        print("Calculating similarity matrix...")
+        similarity_matrix = calculate_similarity_matrix(train_features, test_features)
+        
+        # Evaluate matches
+        print("Evaluating matches...")
+        results = evaluate_matches(similarity_matrix, 
+                                 test_metadata['subject_ids'],
+                                 train_metadata['subject_ids'])
+        
+        # Plot and save results
+        print("Saving results...")
+        plot_results(results, output_dir)
+        save_results(results, output_dir)
+        
+        # Print results
+        print("\nEvaluation Results:")
+        for k, metrics in results.items():
+            print(f"\nTop-{k}:")
+            print(f"  Overall Accuracy: {metrics['accuracy']:.4f}")
+            print(f"  Precision: {metrics['precision']:.4f}")
+            print(f"  Recall: {metrics['recall']:.4f}")
+            print(f"  F1 Score: {metrics['f1']:.4f}")
+            print("\n  Per-Subject Accuracy:")
+            for subject_id, acc in sorted(metrics['subject_accuracies'].items()):
+                print(f"    Subject {subject_id}: {acc:.4f}")
+        
+    except Exception as e:
+        print(f"Error during evaluation: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main() 
