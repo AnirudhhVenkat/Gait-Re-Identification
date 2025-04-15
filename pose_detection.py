@@ -25,7 +25,7 @@ class PoseDetector:
             model_complexity=1,  # Using the most accurate model
             enable_segmentation=True,  # Enable segmentation for better occlusion handling
             smooth_landmarks=True,  # Enable smoothing for better tracking
-            static_image_mode=False  # Video mode for better performance
+            static_image_mode=False  # Video mode for better performanceq
         )
         
         print(f"Initializing camera {camera_id}...")

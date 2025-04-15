@@ -43,51 +43,55 @@ def calculate_cycle_parameters(ankle_heights: np.ndarray) -> Tuple[int, int]:
     
     return min_length, distance
 
-def detect_gait_events(pose_data_list: List[Dict[str, Any]], 
-                      distance: int = 20) -> List[GaitEvent]:
-    """Detect all gait events (heel strikes and mid-swings) for both feet."""
+def detect_gait_events(pose_data: List[Dict[str, Any]]) -> Tuple[List[GaitEvent], List[float], List[float]]:
+    """Detect gait events (heel strikes and mid-swings) from pose data."""
     events = []
-    right_ankle_heights = []
-    left_ankle_heights = []
+    right_heights = []
+    left_heights = []
     
-    # First pass: collect ankle heights
-    for pose_data in pose_data_list:
-        right_ankle = np.array([
-            pose_data['right_ankle']['x'],
-            pose_data['right_ankle']['y'],
-            pose_data['right_ankle']['z']
-        ])
-        left_ankle = np.array([
-            pose_data['left_ankle']['x'],
-            pose_data['left_ankle']['y'],
-            pose_data['left_ankle']['z']
-        ])
-        right_ankle_heights.append(right_ankle[1])
-        left_ankle_heights.append(left_ankle[1])
+    # Extract ankle heights
+    for i, pose in enumerate(pose_data):
+        right_heights.append(pose['right_ankle']['y'])
+        left_heights.append(pose['left_ankle']['y'])
     
-    right_ankle_heights = np.array(right_ankle_heights)
-    left_ankle_heights = np.array(left_ankle_heights)
+    # Find local minima and maxima
+    right_minima = find_local_minima(right_heights)
+    left_minima = find_local_minima(left_heights)
+    right_maxima = find_local_maxima(right_heights)
+    left_maxima = find_local_maxima(left_heights)
     
-    # Find events for both feet
-    right_heel_strikes, _ = find_peaks(-right_ankle_heights, distance=distance)
-    right_mid_swings, _ = find_peaks(right_ankle_heights, distance=distance)
-    left_heel_strikes, _ = find_peaks(-left_ankle_heights, distance=distance)
-    left_mid_swings, _ = find_peaks(left_ankle_heights, distance=distance)
+    # Create events
+    for frame in right_minima:
+        events.append(GaitEvent(type='heel_strike', foot='right', frame=frame, height=right_heights[frame]))
+    for frame in left_minima:
+        events.append(GaitEvent(type='heel_strike', foot='left', frame=frame, height=left_heights[frame]))
+    for frame in right_maxima:
+        events.append(GaitEvent(type='mid_swing', foot='right', frame=frame, height=right_heights[frame]))
+    for frame in left_maxima:
+        events.append(GaitEvent(type='mid_swing', foot='left', frame=frame, height=left_heights[frame]))
     
-    # Create event objects
-    for idx in right_heel_strikes:
-        events.append(GaitEvent('heel_strike', 'right', idx, right_ankle_heights[idx]))
-    for idx in left_heel_strikes:
-        events.append(GaitEvent('heel_strike', 'left', idx, left_ankle_heights[idx]))
-    for idx in right_mid_swings:
-        events.append(GaitEvent('mid_swing', 'right', idx, right_ankle_heights[idx]))
-    for idx in left_mid_swings:
-        events.append(GaitEvent('mid_swing', 'left', idx, left_ankle_heights[idx]))
+    # Sort events by frame
+    events.sort(key=lambda e: e.frame)
     
-    # Sort events by frame number
-    events.sort(key=lambda x: x.frame)
-    
-    return events, right_ankle_heights, left_ankle_heights
+    return events, right_heights, left_heights
+
+def find_local_minima(heights: List[float], window_size: int = 5) -> List[int]:
+    """Find local minima in a list of heights."""
+    minima = []
+    for i in range(window_size, len(heights) - window_size):
+        window = heights[i-window_size:i+window_size+1]
+        if heights[i] == min(window):
+            minima.append(i)
+    return minima
+
+def find_local_maxima(heights: List[float], window_size: int = 5) -> List[int]:
+    """Find local maxima in a list of heights."""
+    maxima = []
+    for i in range(window_size, len(heights) - window_size):
+        window = heights[i-window_size:i+window_size+1]
+        if heights[i] == max(window):
+            maxima.append(i)
+    return maxima
 
 def is_complete_cycle(cycle_events: List[GaitEvent]) -> bool:
     """Check if a cycle contains all necessary gait events."""
@@ -168,38 +172,18 @@ def analyze_cycle(cycle: List[Dict[str, Any]], events: List[GaitEvent]) -> Dict[
     # Calculate other statistics
     for pose_data in cycle:
         # Get ankle heights
-        right_ankle = np.array([
-            pose_data['right_ankle']['x'],
-            pose_data['right_ankle']['y'],
-            pose_data['right_ankle']['z']
-        ])
-        left_ankle = np.array([
-            pose_data['left_ankle']['x'],
-            pose_data['left_ankle']['y'],
-            pose_data['left_ankle']['z']
-        ])
+        right_ankle_y = pose_data['right_ankle']['y']
+        left_ankle_y = pose_data['left_ankle']['y']
         
         # Update min/max heights
-        stats['right_ankle_min'] = min(stats['right_ankle_min'], right_ankle[1])
-        stats['right_ankle_max'] = max(stats['right_ankle_max'], right_ankle[1])
-        stats['left_ankle_min'] = min(stats['left_ankle_min'], left_ankle[1])
-        stats['left_ankle_max'] = max(stats['left_ankle_max'], left_ankle[1])
-        
-        # Get hip positions
-        right_hip = np.array([
-            pose_data['right_hip']['x'],
-            pose_data['right_hip']['y'],
-            pose_data['right_hip']['z']
-        ])
-        left_hip = np.array([
-            pose_data['left_hip']['x'],
-            pose_data['left_hip']['y'],
-            pose_data['left_hip']['z']
-        ])
+        stats['right_ankle_min'] = min(stats['right_ankle_min'], right_ankle_y)
+        stats['right_ankle_max'] = max(stats['right_ankle_max'], right_ankle_y)
+        stats['left_ankle_min'] = min(stats['left_ankle_min'], left_ankle_y)
+        stats['left_ankle_max'] = max(stats['left_ankle_max'], left_ankle_y)
         
         # Calculate widths
-        stats['step_widths'].append(np.abs(right_ankle[0] - left_ankle[0]))
-        stats['hip_widths'].append(np.abs(right_hip[0] - left_hip[0]))
+        stats['step_widths'].append(abs(pose_data['right_ankle']['x'] - pose_data['left_ankle']['x']))
+        stats['hip_widths'].append(abs(pose_data['right_hip']['x'] - pose_data['left_hip']['x']))
     
     # Calculate means and stds
     stats['step_width_mean'] = np.mean(stats['step_widths'])
